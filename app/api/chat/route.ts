@@ -1,121 +1,142 @@
 // ─── Dependencies ─────────────────────────────────────────────────────────────
-// Run: npm install @ai-sdk/google @ai-sdk/openai @ai-sdk/anthropic
-//
-// Required .env.local keys (only needed for server-side fallback;
-// users can supply their own keys from the UI instead):
-//   GOOGLE_GENERATIVE_AI_API_KEY=...
-//   OPENAI_API_KEY=...
-//   ANTHROPIC_API_KEY=...
+// npm install @ai-sdk/google @ai-sdk/openai @ai-sdk/anthropic
 
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
-import { createOpenAI } from "@ai-sdk/openai";
-import { createAnthropic } from "@ai-sdk/anthropic";
+import { createOpenAI }             from "@ai-sdk/openai";
+import { createAnthropic }          from "@ai-sdk/anthropic";
 import { convertToModelMessages, streamText, UIMessage } from "ai";
 
 export const runtime = "edge";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Provider = "google" | "openai" | "anthropic";
+type Provider   = "google" | "openai" | "anthropic";
 type PromptMode = "eli5" | "senior" | "custom";
 
 interface RequestBody {
-  messages: UIMessage[];
-  mode: PromptMode;
-  temperature: number;      // 0.0–2.0 (clamped to 1.0 for Anthropic)
-  topP: number;             // 0.0–1.0
-  systemPrompt?: string;    // only used when mode === "custom"
-  modelId: string;          // e.g. "gemini-3.1-flash-lite"
-  provider: Provider;       // determines which SDK adapter to use
+  messages:     UIMessage[];
+  mode:         PromptMode;
+  temperature:  number;
+  topP:         number;
+  systemPrompt?: string;
+  modelId:      string;
+  provider:     Provider;
   apiKeys?: {
-    google?: string;
-    openai?: string;
+    google?:    string;
+    openai?:    string;
     anthropic?: string;
   };
 }
 
-// ─── Predefined system prompts ────────────────────────────────────────────────
+// ─── System prompts ───────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPTS = {
-  // Beginner-friendly: avoids jargon, uses analogies
-  eli5: `You are a patient, friendly teacher explaining things to a curious
-5-year-old. Use simple words, short sentences, and relatable analogies.
-Never use jargon. Make it visual and fun.`,
-
-  // Expert mode: skip basics, use precise terminology
-  senior: `You are a staff engineer. Be direct, technical, and precise.
-Use correct CS/programming terminology. Assume deep knowledge of
-data structures, algorithms, and modern web development. Skip basics.
-Use code examples when they clarify faster than prose.`,
+  eli5:   `You are a patient, friendly teacher explaining things to a curious 5-year-old. Simple words, short sentences, relatable analogies. No jargon.`,
+  senior: `You are a staff engineer. Direct, technical, precise. Use correct CS terminology. Assume deep knowledge. Skip basics.`,
 } as const;
+
+// ─── Key resolver ─────────────────────────────────────────────────────────────
+// Returns the first available key: user-supplied → server env → undefined.
+// If undefined is returned the handler sends a 401 before ever calling the provider.
+
+function resolveKey(provider: Provider, userKey?: string): string | undefined {
+  const envKey: Record<Provider, string | undefined> = {
+    google:    process.env.GOOGLE_GENERATIVE_AI_API_KEY,
+    openai:    process.env.OPENAI_API_KEY,
+    anthropic: process.env.ANTHROPIC_API_KEY,
+  };
+  return userKey?.trim() || envKey[provider];
+}
+
+// ─── Error response helper ────────────────────────────────────────────────────
+
+function errorResponse(message: string, status = 500) {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
 // ─── Route handler ────────────────────────────────────────────────────────────
 
 export async function POST(req: Request) {
-  const {
-    messages,
-    mode,
-    temperature,
-    topP,
-    systemPrompt,
-    modelId,
-    provider,
-    apiKeys,
-  } = (await req.json()) as RequestBody;
+  let body: RequestBody;
 
-  // ── Resolve system prompt ──────────────────────────────────────────────────
-  // "custom" mode uses the user-supplied systemPrompt from the UI.
-  // "eli5" / "senior" use the predefined prompts above.
-  const resolvedSystem =
-    mode === "custom" && systemPrompt?.trim()
-      ? systemPrompt
-      : SYSTEM_PROMPTS[mode as keyof typeof SYSTEM_PROMPTS] ??
-        SYSTEM_PROMPTS.senior;
+  // ── Parse body ───────────────────────────────────────────────────────────
+  try {
+    body = await req.json();
+  } catch {
+    return errorResponse("Invalid JSON in request body.", 400);
+  }
 
-  // ── Build provider instance (BYOK pattern) ────────────────────────────────
-  // Each factory accepts an optional apiKey. The user's key (from localStorage
-  // via request body) takes precedence; the server env var is the fallback.
-  // This way the app works for others without exposing your own key.
-  let model;
+  const { messages, mode, temperature, topP, systemPrompt, modelId, provider, apiKeys } = body;
 
-  if (provider === "google") {
-    const ai = createGoogleGenerativeAI({
-      apiKey: apiKeys?.google || process.env.GOOGLE_GENERATIVE_AI_API_KEY,
-    });
-    model = ai(modelId);
-  } else if (provider === "openai") {
-    const ai = createOpenAI({
-      apiKey: apiKeys?.openai || process.env.OPENAI_API_KEY,
-    });
-    model = ai(modelId);
-  } else if (provider === "anthropic") {
-    const ai = createAnthropic({
-      apiKey: apiKeys?.anthropic || process.env.ANTHROPIC_API_KEY,
-    });
-    model = ai(modelId);
-  } else {
-    return new Response(
-      JSON.stringify({ error: `Unknown provider: "${provider}"` }),
-      { status: 400, headers: { "Content-Type": "application/json" } }
+  // ── Validate required fields ─────────────────────────────────────────────
+  if (!modelId?.trim())  return errorResponse("No model ID provided.", 400);
+  if (!provider?.trim()) return errorResponse("No provider specified.", 400);
+
+  // ── Resolve API key — fail fast if missing ───────────────────────────────
+  // This prevents the request hanging; the client gets a clean 401 immediately.
+  const apiKey = resolveKey(provider, apiKeys?.[provider as Provider]);
+
+  if (!apiKey) {
+    const label = { google: "Google", openai: "OpenAI", anthropic: "Anthropic" }[provider] ?? provider;
+    return errorResponse(
+      `No API key for ${label}. Open the settings panel → API Keys and paste your ${label} key, or add it to .env.local.`,
+      401
     );
   }
 
-  // ── Temperature clamping ───────────────────────────────────────────────────
-  // Anthropic's API caps temperature at 1.0. Google & OpenAI accept up to 2.0.
-  // Silently clamping avoids a 422 error from Anthropic when the slider is > 1.
+  // ── Build provider model instance ────────────────────────────────────────
+  let model;
+  try {
+    if (provider === "google") {
+      model = createGoogleGenerativeAI({ apiKey })(modelId);
+    } else if (provider === "openai") {
+      model = createOpenAI({ apiKey })(modelId);
+    } else if (provider === "anthropic") {
+      model = createAnthropic({ apiKey })(modelId);
+    } else {
+      return errorResponse(`Unknown provider: "${provider}".`, 400);
+    }
+  } catch (err) {
+    return errorResponse(`Failed to initialise ${provider} provider: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // ── Resolve system prompt ─────────────────────────────────────────────────
+  const system =
+    mode === "custom" && systemPrompt?.trim()
+      ? systemPrompt
+      : SYSTEM_PROMPTS[mode as keyof typeof SYSTEM_PROMPTS] ?? SYSTEM_PROMPTS.senior;
+
+  // ── Anthropic caps temperature at 1.0 ────────────────────────────────────
   const clampedTemp = provider === "anthropic" ? Math.min(temperature, 1.0) : temperature;
 
-  // ── Note on topP for newer Gemini models ──────────────────────────────────
-  // Gemini 3.5 Flash does NOT support topP / temperature — it will be ignored.
-  // Gemini 3.1 Flash-Lite DOES support both. The SDK passes them through;
-  // unsupported params are silently dropped by the provider, not an error.
-  const result = streamText({
-    model,
-    system: resolvedSystem,
-    messages: await convertToModelMessages(messages),
-    temperature: clampedTemp,
-    topP,
-  });
+  // ── Stream ───────────────────────────────────────────────────────────────
+  // Errors here are provider-level (invalid key, model not found, quota exceeded, etc.)
+  try {
+    const result = streamText({
+      model,
+      system,
+      messages: await convertToModelMessages(messages),
+      temperature: clampedTemp,
+      topP,
+    });
+    return result.toUIMessageStreamResponse();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
 
-  return result.toUIMessageStreamResponse();
+    // Surface common provider errors with clearer copy
+    if (msg.includes("API key") || msg.includes("401") || msg.includes("403")) {
+      return errorResponse(`Invalid or expired API key for ${provider}. Check it in the settings panel.`, 401);
+    }
+    if (msg.includes("quota") || msg.includes("429") || msg.includes("rate")) {
+      return errorResponse(`Rate limit or quota exceeded for ${provider}. Wait a moment and try again.`, 429);
+    }
+    if (msg.includes("model") || msg.includes("404")) {
+      return errorResponse(`Model "${modelId}" not found or unavailable on ${provider}.`, 404);
+    }
+
+    return errorResponse(`${provider} error: ${msg}`);
+  }
 }
