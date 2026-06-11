@@ -8,8 +8,8 @@ A minimal, mobile-friendly AI chat interface built with **Next.js** and the **Ve
 
 ## Screenshot
 
-<!-- Replace with your own screenshot -->
-<!-- ![AI Chat Studio](./public/screenshot.png) -->
+<img width="1919" height="965" alt="image" src="https://github.com/user-attachments/assets/79010891-aebe-4fa3-981f-bfe8ac36c4bf" />
+
 
 ---
 
