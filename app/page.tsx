@@ -371,7 +371,7 @@ export default function ChatPage() {
                 <div className="mt-2 space-y-2">
                   <p className="text-[11px] leading-relaxed rounded-lg px-3 py-2"
                      style={{ color: THEME.textMuted, backgroundColor: THEME.bgInput, border: `1px solid ${THEME.border}` }}>
-                    localStorage only. Falls back to server <code style={{ color: THEME.textSub }}>.env</code> if empty.
+                   Stored locally in your browser.
                   </p>
                   {PROVIDERS.map(prov => (
                     <div key={prov} className="flex items-center gap-2">
